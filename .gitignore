@@ -1,0 +1,10 @@
+venv/
+.ipynb_checkpoints/
+
+# Generated intermediate/feature CSVs -- large and fully reproducible by
+# re-running the scripts/ pipeline in order, so they don't belong in git.
+# Small result artifacts (hyperparams, cost-tradeoff results, normalization
+# stats) are kept since they're cheap and document a specific run's output.
+**/data/*_features.csv
+**/data/*_with_RUL.csv
+**/data/*_with_clusters.csv
