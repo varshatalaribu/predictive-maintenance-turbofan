@@ -1,8 +1,10 @@
 # Predictive Maintenance: Turbofan RUL Model
 
 Predicting Remaining Useful Life (RUL) for aircraft turbofan engines using
-NASA's C-MAPSS (FD001) dataset, and translating those predictions into a
-maintenance-scheduling decision with a cost-tradeoff simulation.
+NASA's C-MAPSS dataset, and translating those predictions into a
+maintenance-scheduling decision with a cost-tradeoff simulation. Built
+dataset by dataset, starting with the simplest case (FD001) and working up
+to harder variants (FD002, and eventually FD003/FD004).
 
 ## The business problem
 
@@ -19,107 +21,166 @@ how many operating cycles an engine has left, evaluated on NASA's held-out
 test set and then wired into a simple cost simulation to decide *when* to act
 on a prediction.
 
-## Data and approach
+**Evaluation methodology (both datasets)**: two MAE numbers are tracked for
+every model — across all rows, and restricted to the "decision zone" (true
+RUL ≤ 30 cycles), the window where a real maintenance decision actually gets
+made. The two don't always move together, and the decision-zone number is
+the one that matters. Engines are always split by unit, never by row, so no
+engine's cycles appear in both train and validation/test.
 
-**Dataset**: NASA C-MAPSS FD001 — 100 training engines and 100 test engines,
-each simulated to failure (train) or truncated partway through life (test),
-with 21 sensor readings and 3 operational settings per cycle. Source:
-`train_FD001.txt`, `test_FD001.txt`, `RUL_FD001.txt`.
+---
 
-**Label**: Remaining Useful Life = `max_cycle_for_this_engine - current_cycle`,
-computed per engine. The label is capped ("clipped") at 125 cycles — early in
-an engine's life RUL is not meaningfully predictable from sensor data alone,
-so capping keeps the model from wasting capacity trying to distinguish
-"250 cycles left" from "300 cycles left" instead of focusing on the window
-that matters operationally, near failure.
+## FD001: single operating condition, single fault mode
 
-**Features**: raw sensor readings, plus per-engine rolling statistics
-(5-cycle and 20-cycle rolling mean, rolling std, rolling min/max), a
-5-cycle rate-of-change, and each sensor's deviation from that engine's own
-first-5-cycle baseline. 7 constant/non-informative columns were dropped.
-None of the engineered features use information from an engine's own final
-cycle or max cycle — that would leak the label.
+**Dataset**: 100 training engines, 100 test engines, each simulated to
+failure (train) or truncated partway through life (test), 21 sensors + 3
+operational settings per cycle, one flight regime for the whole dataset.
+Source: `FD001/data/train_FD001.txt`, `test_FD001.txt`, `RUL_FD001.txt`.
 
-**Model**: XGBoost gradient-boosted trees, tuned via `RandomizedSearchCV`
-with `GroupKFold` cross-validation (engines never split across folds, so no
-engine's cycles appear in both train and validation).
+**Label**: RUL = `max_cycle_for_this_engine - current_cycle`, capped at 125
+cycles — early in an engine's life RUL isn't meaningfully predictable from
+sensor data alone, so capping stops the model from wasting capacity on
+"250 cycles left" vs. "300 cycles left" instead of the window that matters.
 
-**Evaluation methodology**: two numbers are tracked for every model —
-MAE across all rows, and MAE restricted to the "decision zone" (true
-RUL ≤ 30 cycles), since that is the window where a real maintenance
-decision actually gets made. The two do not always move together, and the
-decision-zone number is the one that matters.
+**Features**: raw sensor readings plus per-engine rolling statistics
+(5/20-cycle rolling mean, rolling std, rolling min/max), 5-cycle
+rate-of-change, and deviation from each engine's own first-5-cycle
+baseline. 7 constant/non-informative columns dropped.
 
-## Model performance
+**Model**: XGBoost, tuned via `RandomizedSearchCV` + `GroupKFold`
+cross-validation, scored on a custom decision-zone metric rather than plain
+MAE.
+
+**Model performance** (NASA's held-out test set):
 
 | Model | All-engine MAE | Decision-zone MAE | Notes |
 |---|---|---|---|
 | Linear regression | 13.37 | — | Baseline |
-| XGBoost (default/hand-picked params) | 10.49 | 4.89 | On NASA's held-out test set |
+| XGBoost (hand-picked params) | 10.49 | 4.89 | |
 | XGBoost (tuned) | — | 4.18 | ~15% improvement in the decision zone |
 
-Hyperparameters were tuned against a custom decision-zone scorer, not plain
-MAE, so the search rewards accuracy where it is operationally useful rather
-than accuracy on engines with hundreds of cycles left. Best hyperparameters
-are saved in `data/best_hyperparams.json`.
+**Cost-tradeoff analysis**: sweeping a maintenance-trigger threshold
+(predicted RUL) from 1–120 cycles against assumed costs ($2,000/planned
+visit, $10,000/failure, $35 per cycle of wasted remaining life) produces a
+U-shaped cost curve. Minimum at threshold = **6 cycles**: all 20 validation
+engines caught, 5.5 cycles average lead time, total cost **$43,850** — a
+**78% reduction** from the $200,000 fully-reactive baseline. See
+`FD001/plots/cost_tradeoff.png` and `FD001/data/cost_tradeoff_results.csv`.
 
-## Cost-tradeoff analysis
+---
 
-A MAE number doesn't say when to schedule maintenance. So predictions were
-run through a simulation: sweep a trigger threshold (predicted RUL) from 1
-to 120 cycles, and for each of the 20 validation engines, price the outcome
-of scheduling maintenance the first time predicted RUL drops to or below
-that threshold.
+## FD002: 6 operating conditions, single fault mode
 
-Assumed costs: $2,000 for a planned visit, plus $35 for every cycle of
-remaining life still on the clock when the visit happens (waste), or
-$10,000 if the engine is never caught before failure. A fully reactive
-strategy (no model) costs $10,000 × 20 = $200,000.
+**What's different from FD001**: engines cycle through 6 distinct
+combinations of altitude/Mach number/throttle (`setting_1/2/3`) instead of
+one fixed regime — the same raw sensor reading can be normal under one
+condition and abnormal under another, so a value can't be interpreted
+without knowing which regime produced it (think: engine temperature reading
+different but equally healthy values at cruise vs. climbing vs. idle).
 
-The resulting cost-vs-threshold curve is U-shaped: trigger too late (low
-threshold, waiting for near-certainty) and engines get missed, paying the
-failure cost; trigger too early (high threshold, acting on the first hint
-of wear) and good engine life gets wasted. The minimum lands at a threshold
-of **6 cycles**: all 20 engines caught, 5.5 cycles average lead time before
-failure, total cost **$43,850** — a **78% reduction** from the $200,000
-reactive baseline. See `plots/cost_tradeoff.png` and
-`data/cost_tradeoff_results.csv` for the full curve.
+**Dataset**: 260 training engines, 259 test engines. Source:
+`FD002/data/train_FD002.txt`, `test_FD002.txt`, `RUL_FD002.txt`.
 
-**Caveat**: the dollar figures above are assumptions used to explore the
-shape of the tradeoff, not measured costs from a real maintenance budget.
-The existence of an interior optimum is a robust finding; the exact
-threshold (6 cycles) depends on those inputs.
+**Operating-condition normalization**: rows are clustered into 6 operating
+conditions via `KMeans` on `setting_1/2/3`, then every sensor is converted
+to "how many standard deviations from normal-for-this-condition" using
+per-condition mean/std computed from training data only. The rolling-window
+feature recipe from FD001 is then applied on top of these normalized
+values, and operating condition is one-hot encoded as 6 additional
+features. 4 sensors that showed zero variance within any single condition
+(`sensor_1, sensor_5, sensor_18, sensor_19`) were dropped — a different,
+narrower list than FD001's, since `setting_3` and two sensors that were
+constant in FD001 (`sensor_10, sensor_16`) turned out to carry real signal
+here.
+
+**Model**: XGBoost. Hyperparameter tuning was attempted (`RandomizedSearchCV`
++ `GroupKFold`, same as FD001) but **the tuned model was rejected** — it
+scored better under cross-validation (decision-zone MAE 4.84 → 4.68) but
+*worse* on the real held-out test set (3.70 → 4.32), and its training-set
+MAE dropped sharply (9.31 → 5.52) while test performance didn't improve, a
+clear overfitting signature: the tuned parameters (deeper trees, more
+trees, no feature subsampling) gave the model enough capacity to fit
+training-engine-specific quirks rather than general wear patterns. The
+final model uses the original hand-picked hyperparameters instead — a real
+held-out test set overrules a CV score when they disagree.
+
+**Model performance** (NASA's held-out test set):
+
+| Model | All-engine MAE | Decision-zone MAE | Notes |
+|---|---|---|---|
+| Linear regression | 12.70 | — | Baseline, already better than FD001's linear baseline |
+| XGBoost (hand-picked params) | 17.68 | 3.70 | **Final model** |
+| XGBoost (CV-tuned) | 17.69 | 4.32 | Rejected — overfit, see above |
+
+Worth noting: all-engine MAE is *worse* than FD001's (17.68 vs. 10.49) but
+decision-zone MAE is *better* (3.70 vs. 4.18/4.89) — FD002 engines simply
+run far longer overall (max observed RUL 377 vs. FD001's shorter runs), so
+there's more "doesn't matter operationally" room for the model to be
+imprecise in, inflating all-engine MAE without affecting the number that
+actually matters.
+
+**RUL cap**: re-tested for FD002 the same way as FD001 (candidate caps
+30–200). On raw decision-zone MAE, lower caps looked dramatically better
+(cap=30 gave 3.38 vs. cap=125's 5.02) — but this was largely an artifact of
+training the model to ignore everything outside the window it's scored on
+(cap=30 equals the decision-zone boundary itself). Re-running the actual
+cost-tradeoff simulation at several candidate caps showed the dollar
+outcome barely moves (77.2%–78.0% savings across caps 30/40/50/125,
+$87,800–$91,300 total cost) — confirming the earlier lesson that the RUL
+cap doesn't meaningfully affect real operational outcomes, and MAE alone
+can be a misleading way to choose it. Cap = 125 was kept for consistency
+with FD001.
+
+**Cost-tradeoff analysis**: same simulation as FD001, same assumed costs.
+Minimum at threshold = **8–9 cycles** (varies slightly run to run):
+all 40 validation engines caught, ~7 cycles average lead time, total cost
+**~$90,000** — a **~77% reduction** from the $400,000 fully-reactive
+baseline (40 validation engines × $10,000). See `FD002/plots/cost_tradeoff.png`
+and `FD002/data/cost_tradeoff_results.csv`.
+
+---
 
 ## Key findings and lessons learned
 
-- **The RUL cap value barely matters, as long as one exists.** Caps of 100,
-  110, 125, 140, and 160 all scored similarly on decision-zone MAE; removing
-  the cap entirely measurably hurt accuracy near failure.
-- **All-rows MAE and decision-zone MAE don't always move together** — this
-  showed up both in the RUL-cap comparison and in hyperparameter tuning.
-  Optimizing and evaluating against the metric that matches the business
-  question is more important than optimizing the metric that's easiest to
-  compute.
+- **All-rows MAE and decision-zone MAE don't always move together** — the
+  central lesson of this project, confirmed independently in FD001 (RUL cap
+  comparison, hyperparameter tuning) and FD002 (RUL cap comparison, and the
+  general gap between the two metrics being much larger than in FD001).
+  Optimize and evaluate against the metric that matches the actual business
+  question, not whichever is easiest to compute.
+- **A better cross-validation score doesn't guarantee a better real-world
+  model.** FD002's hyperparameter tuning is a concrete example: CV improved,
+  the real test set got worse, and the training-fit-vs-test-performance gap
+  made the overfitting visible and explainable, not just a mystery drop.
+- **The RUL cap value barely matters once you measure the right thing.**
+  True in both datasets, for different reasons: FD001 showed any reasonable
+  cap works about the same; FD002 showed that even a cap that looks much
+  better on MAE can turn out to barely matter — or actively mislead — once
+  translated into actual dollar cost.
 - **Engine-grouped splitting is non-negotiable.** Any row-based split leaks
   near-identical adjacent cycles of the same engine across train/validation,
   producing validation scores that look great and mean nothing.
-- **Hyperparameter tuning delivered a real, if modest, gain**: ~15% lower
-  decision-zone MAE on the held-out NASA test set.
+- **Feature engineering has to be re-earned per dataset, not copy-pasted.**
+  FD001's "constant column" drop list didn't transfer directly to FD002 —
+  two sensors that were dead in FD001 turned out to be informative in FD002
+  once operating-condition noise was accounted for, and vice versa for
+  `setting_3`.
 
 ## Limitations and next steps
 
-- Cost figures are assumptions, not measured facts — re-run
-  `scripts/11_cost_tradeoff.py` with real numbers before using this to
-  inform an actual maintenance schedule.
-- Trained and evaluated only on FD001 (one operating condition, one fault
-  mode). FD002–FD004 are harder variants and a natural next step.
+- Cost figures (both datasets) are assumptions, not measured facts — re-run
+  the `cost_tradeoff.py` script for the relevant dataset with real numbers
+  before using this to inform an actual maintenance schedule.
+- FD003 (2 fault modes, 1 operating condition) and FD004 (2 fault modes, 6
+  operating conditions) are the remaining C-MAPSS subsets — natural next
+  steps, especially FD004 as the hardest variant combining both challenges.
 - LightGBM/CatBoost as alternative models, and an LSTM/sequence model as a
   more ambitious follow-up, were discussed but not implemented.
-- No anomaly-detection layer — this model assumes normal degradation and
-  would not flag an unusual failure mode outside its training distribution.
-- Validation is a single 20-engine holdout; averaging across several random
-  splits (or extending `GroupKFold` to every evaluation) would tighten the
-  estimates.
+- No anomaly-detection layer — both models assume normal degradation and
+  wouldn't flag a failure mode outside their training distribution.
+- Validation is a single random holdout per dataset; averaging across
+  several random splits (or extending `GroupKFold` to every evaluation)
+  would tighten the estimates.
 
 ## Project structure
 
@@ -130,9 +191,9 @@ PredictiveMaintenance/
 │   ├── plots/                # sensor trends, RUL curve, cost-tradeoff plot
 │   └── scripts/               # 01_load_explore.py ... 11_cost_tradeoff.py, run top to bottom
 ├── FD002/                  # 6 operating conditions, single fault mode
-│   ├── data/
+│   ├── data/                 # raw + processed CSVs (generated feature CSVs are gitignored, see below)
 │   ├── plots/
-│   └── scripts/
+│   └── scripts/               # 01_load_explore.py ... 10_cost_tradeoff.py, run top to bottom
 ├── venv/                   # shared Python environment for all datasets
 ├── requirements.txt
 └── README.md
@@ -140,7 +201,12 @@ PredictiveMaintenance/
 
 Each dataset's scripts are self-contained and run from inside their own
 `scripts/` folder (they reference `../data/` and `../plots/` relatively),
-sharing the one project-level `venv/`.
+sharing the one project-level `venv/`. Large generated feature CSVs
+(`*_features.csv`, `*_with_RUL.csv`, `*_with_clusters.csv`) are excluded
+from git — they're fully reproducible by running the scripts in order, and
+some exceed GitHub's file-size limits. Small result artifacts (tuned
+hyperparameters, cost-tradeoff results, normalization stats) are kept since
+they document a specific run's output.
 
 ## Setup
 
@@ -158,4 +224,3 @@ that dataset's `data/`), e.g.:
 cd FD001/scripts   # or FD002/scripts
 python3 01_load_explore.py
 ```
-
